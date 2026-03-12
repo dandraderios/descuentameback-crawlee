@@ -18,6 +18,8 @@ from crawlee.crawlers import (
     BasicCrawlingContext,
     BeautifulSoupCrawler,
     BeautifulSoupCrawlingContext,
+    PlaywrightCrawler,
+    PlaywrightCrawlingContext,
 )
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
@@ -228,6 +230,95 @@ async def scrape_with_playwright(url: str) -> Dict[str, Any]:
             await browser.close()
 
 
+async def scrape_with_playwright_crawler(url: str) -> Dict[str, Any]:
+    started_at = time.perf_counter()
+    logger.info("🎭 Estrategia PlaywrightCrawler | url=%s", url)
+    result: Dict[str, Any] = {
+        "url": url,
+        "title": None,
+        "h1s": [],
+        "h2s": [],
+        "h3s": [],
+    }
+    crawler = PlaywrightCrawler(
+        max_request_retries=1,
+        request_handler_timeout=timedelta(seconds=60),
+        max_requests_per_crawl=1,
+        browser_type="chromium",
+        headless=True,
+        browser_launch_options={
+            "args": [
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        },
+        browser_new_context_options={
+            "locale": "es-CL",
+            "timezone_id": "America/Santiago",
+            "user_agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "viewport": {"width": 1366, "height": 768},
+            "extra_http_headers": {"accept-language": "es-CL,es;q=0.9,en;q=0.8"},
+        },
+    )
+    done = asyncio.get_running_loop().create_future()
+
+    @crawler.router.default_handler
+    async def request_handler(context: PlaywrightCrawlingContext) -> None:
+        logger.info("🎭 PlaywrightCrawler procesando respuesta | url=%s", context.request.url)
+        await context.page.add_init_script(
+            """
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'languages', { get: () => ['es-CL', 'es', 'en'] });
+            Object.defineProperty(navigator, 'platform', { get: () => 'MacIntel' });
+            """
+        )
+        html = await context.page.content()
+        soup = BeautifulSoup(html, "html.parser")
+        html_preview = html[:500].replace("\n", " ").replace("\r", " ")
+        logger.info(
+            "🎭 PlaywrightCrawler html preview | url=%s html_500=%s",
+            context.request.url,
+            html_preview,
+        )
+        parsed = {
+            "url": context.request.url,
+            "title": await context.page.title(),
+            "h1s": [h1.text for h1 in soup.find_all("h1")],
+            "h2s": [h2.text for h2 in soup.find_all("h2")],
+            "h3s": [h3.text for h3 in soup.find_all("h3")],
+        }
+        if not done.done():
+            done.set_result(parsed)
+
+    try:
+        await crawler.run([url])
+        elapsed = time.perf_counter() - started_at
+        logger.info(
+            "🎭 PlaywrightCrawler completado | url=%s elapsed=%.2fs",
+            url,
+            elapsed,
+        )
+    except Exception as exc:
+        elapsed = time.perf_counter() - started_at
+        logger.warning("⚠️ PlaywrightCrawler fallo para %s: %s", url, exc)
+        logger.warning(
+            "⚠️ PlaywrightCrawler duracion con fallo | url=%s elapsed=%.2fs",
+            url,
+            elapsed,
+        )
+        if not done.done():
+            done.set_result(result)
+
+    if done.done():
+        return done.result()
+    return result
+
+
 async def scrape_current_page_data(store_id: str, product_url: str) -> Dict[str, Any]:
     normalized_store = normalize_store(store_id)
     strategy = "playwright" if normalized_store == "meli" else "beautifulsoup"
@@ -252,11 +343,11 @@ async def scrape_current_page_data(store_id: str, product_url: str) -> Dict[str,
             soup_data["_strategy"] = "beautifulsoup"
             return soup_data
         logger.warning(
-            "⚠️ Ripley sin data util con BeautifulSoup, usando fallback Playwright | url=%s",
+            "⚠️ Ripley sin data util con BeautifulSoup, usando fallback PlaywrightCrawler | url=%s",
             product_url,
         )
-        data = await scrape_with_playwright(product_url)
-        data["_strategy"] = "beautifulsoup->playwright"
+        data = await scrape_with_playwright_crawler(product_url)
+        data["_strategy"] = "beautifulsoup->playwright-crawler"
         return data
     if normalized_store in {"falabella", "paris"}:
         data = await scrape_with_beautifulsoup(product_url)
