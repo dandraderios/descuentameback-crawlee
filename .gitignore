@@ -27,6 +27,7 @@ logs/
 # Local development
 *.db
 *.sqlite3
+storage/
 
 # IDE
 .vscode/

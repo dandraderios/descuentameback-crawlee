@@ -2,9 +2,7 @@ fastapi==0.110.0
 uvicorn[standard]==0.27.1
 crawlee[playwright]
 playwright==1.58.0
-Pillow>=10.2.0
-vercel-storage
-httpx
-njsparser
 python-dotenv
-PyJWT==2.9.0
+pymongo==4.11.3
+beautifulsoup4==4.12.3
+lxml
