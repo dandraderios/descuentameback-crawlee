@@ -980,8 +980,15 @@ async def run_crawler(
         try:
             await context.page.set_viewport_size({"width": 1440, "height": 1800})
             if handler.screenshot_wait_ms > 0:
-                await context.page.wait_for_timeout(handler.screenshot_wait_ms)
-            screenshot_bytes = await context.page.screenshot(full_page=FULL_PAGE)
+                await context.page.wait_for_timeout(min(handler.screenshot_wait_ms, 1000))
+            screenshot_bytes = await context.page.screenshot(
+                full_page=FULL_PAGE,
+                type="jpeg",
+                quality=70,
+                timeout=15000,
+                animations="disabled",
+                scale="css",
+            )
             context.log.info(f"📸 Screenshot capturado")
 
             # Subir screenshot
@@ -990,7 +997,20 @@ async def run_crawler(
             )
 
         except Exception as e:
-            context.log.error(f"❌ Error screenshot: {e}")
+            context.log.warning(f"⚠️ Screenshot principal falló: {e}")
+            try:
+                screenshot_bytes = await context.page.locator("body").screenshot(
+                    type="jpeg",
+                    quality=70,
+                    timeout=10000,
+                    animations="disabled",
+                )
+                context.log.info("📸 Screenshot fallback capturado")
+                screenshot_url = await uploader.upload_screenshot(
+                    screenshot_bytes, store_key, clean_name
+                )
+            except Exception as inner_e:
+                context.log.error(f"❌ Error screenshot fallback: {inner_e}")
 
         context.log.info(
             f"🏁 Completado - JSON: {bool(json_url)}, Screenshot: {bool(screenshot_url)}"
