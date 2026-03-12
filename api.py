@@ -15,7 +15,7 @@ from fastapi import FastAPI, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from PIL import Image
-from crawlee.browsers import BrowserPool
+from crawlee.browsers import BrowserPool, PlaywrightBrowserPlugin
 from crawlee.crawlers import PlaywrightCrawler, PlaywrightCrawlingContext
 from crawlee.storages import RequestQueue
 from vercel_storage import blob
@@ -903,12 +903,16 @@ async def run_crawler(
             }
         )
 
-    crawler_options["browser_pool"] = BrowserPool.with_default_plugin(
-        browser_type="chromium",
-        headless=True,
-        browser_launch_options=browser_launch_options,
-        browser_new_context_options=browser_new_context_options,
-        max_open_pages_per_browser=1,
+    crawler_options["browser_pool"] = BrowserPool(
+        plugins=[
+            PlaywrightBrowserPlugin(
+                browser_type="chromium",
+                headless=True,
+                browser_launch_options=browser_launch_options,
+                browser_new_context_options=browser_new_context_options,
+                max_open_pages_per_browser=1,
+            )
+        ],
         operation_timeout=timedelta(seconds=60),
     )
 
