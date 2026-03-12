@@ -98,6 +98,16 @@ def require_internal_token(x_internal_token: Optional[str] = Header(default=None
         raise HTTPException(status_code=401, detail="x-internal-token invalido")
 
 
+def has_meaningful_page_data(data: Dict[str, Any]) -> bool:
+    if not isinstance(data, dict):
+        return False
+    if data.get("title"):
+        return True
+    if data.get("h1s") or data.get("h2s") or data.get("h3s"):
+        return True
+    return False
+
+
 async def scrape_with_beautifulsoup(url: str) -> Dict[str, Any]:
     started_at = time.perf_counter()
     logger.info("🕷️ Estrategia BeautifulSoupCrawler | url=%s", url)
@@ -229,15 +239,36 @@ async def scrape_current_page_data(store_id: str, product_url: str) -> Dict[str,
         product_url,
     )
     if normalized_store == "meli":
-        return await scrape_with_playwright(product_url)
-    if normalized_store in {"falabella", "paris", "ripley"}:
-        return await scrape_with_beautifulsoup(product_url)
+        data = await scrape_with_playwright(product_url)
+        data["_strategy"] = "playwright"
+        return data
+    if normalized_store == "ripley":
+        soup_data = await scrape_with_beautifulsoup(product_url)
+        if has_meaningful_page_data(soup_data):
+            logger.info(
+                "🕷️ Ripley resuelto con BeautifulSoup | url=%s",
+                product_url,
+            )
+            soup_data["_strategy"] = "beautifulsoup"
+            return soup_data
+        logger.warning(
+            "⚠️ Ripley sin data util con BeautifulSoup, usando fallback Playwright | url=%s",
+            product_url,
+        )
+        data = await scrape_with_playwright(product_url)
+        data["_strategy"] = "beautifulsoup->playwright"
+        return data
+    if normalized_store in {"falabella", "paris"}:
+        data = await scrape_with_beautifulsoup(product_url)
+        data["_strategy"] = "beautifulsoup"
+        return data
     return {
         "url": product_url,
         "title": None,
         "h1s": [],
         "h2s": [],
         "h3s": [],
+        "_strategy": "unsupported",
     }
 
 
@@ -341,7 +372,7 @@ async def run_price_checker_sync(request: ProductPriceCheckRequest) -> Dict[str,
                 "✅ Scraping completado | product_id=%s store=%s strategy=%s elapsed=%.2fs",
                 product_id,
                 store_id,
-                "playwright" if store_id == "meli" else "beautifulsoup",
+                (result_item["data"] or {}).get("_strategy", "unknown"),
                 elapsed,
             )
         except Exception as exc:
