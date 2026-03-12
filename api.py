@@ -870,6 +870,10 @@ async def run_crawler(
         headless=True,
         browser_type="chromium",
         max_request_retries=0,
+        browser_launch_options={
+            "chromium_sandbox": False,
+            "args": ["--no-sandbox", "--disable-setuid-sandbox"],
+        },
         # Eliminamos max_concurrency y enable_autoscaled_pool que causaban error
     )
 
@@ -883,7 +887,11 @@ async def run_crawler(
                 "headless": True,
                 "retry_on_blocked": False,
                 "use_session_pool": False,
-                "browser_launch_options": {"channel": "chrome"},
+                "browser_launch_options": {
+                    "channel": "chrome",
+                    "chromium_sandbox": False,
+                    "args": ["--no-sandbox", "--disable-setuid-sandbox"],
+                },
                 "browser_new_context_options": {
                     "locale": "es-CL",
                     "timezone_id": "America/Santiago",
