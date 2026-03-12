@@ -15,6 +15,7 @@ from fastapi import FastAPI, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from PIL import Image
+from crawlee.browsers import BrowserPool
 from crawlee.crawlers import PlaywrightCrawler, PlaywrightCrawlingContext
 from crawlee.storages import RequestQueue
 from vercel_storage import blob
@@ -867,13 +868,7 @@ async def run_crawler(
     # === CONFIGURACIÓN OPTIMIZADA (sin parámetros inválidos) ===
     crawler_options = dict(
         max_requests_per_crawl=1,  # Solo 1 request
-        headless=True,
-        browser_type="chromium",
         max_request_retries=0,
-        browser_launch_options={
-            "chromium_sandbox": False,
-            "args": ["--no-sandbox", "--disable-setuid-sandbox"],
-        },
         # Eliminamos max_concurrency y enable_autoscaled_pool que causaban error
     )
 
@@ -881,31 +876,41 @@ async def run_crawler(
     request_queue = await RequestQueue.open(name=f"crawl-{uuid.uuid4()}")
     crawler_options["request_manager"] = request_queue
 
+    browser_launch_options = {
+        "chromium_sandbox": False,
+        "args": ["--no-sandbox", "--disable-setuid-sandbox"],
+    }
+    browser_new_context_options = None
+
     if store_key == "meli":
+        browser_launch_options["channel"] = "chrome"
+        browser_new_context_options = {
+            "locale": "es-CL",
+            "timezone_id": "America/Santiago",
+            "viewport": {"width": 1440, "height": 1800},
+            "user_agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+        }
         crawler_options.update(
             {
-                "headless": True,
                 "retry_on_blocked": False,
                 "use_session_pool": False,
-                "browser_launch_options": {
-                    "channel": "chrome",
-                    "chromium_sandbox": False,
-                    "args": ["--no-sandbox", "--disable-setuid-sandbox"],
-                },
-                "browser_new_context_options": {
-                    "locale": "es-CL",
-                    "timezone_id": "America/Santiago",
-                    "viewport": {"width": 1440, "height": 1800},
-                    "user_agent": (
-                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/122.0.0.0 Safari/537.36"
-                    ),
-                },
                 "goto_options": {"wait_until": "domcontentloaded"},
                 "navigation_timeout": timedelta(seconds=120),
             }
         )
+
+    crawler_options["browser_pool"] = BrowserPool.with_default_plugin(
+        browser_type="chromium",
+        headless=True,
+        browser_launch_options=browser_launch_options,
+        browser_new_context_options=browser_new_context_options,
+        max_open_pages_per_browser=1,
+        operation_timeout=timedelta(seconds=60),
+    )
 
     crawler = PlaywrightCrawler(id=str(uuid.uuid4()), **crawler_options)
 
