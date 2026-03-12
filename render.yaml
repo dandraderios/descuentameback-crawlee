@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: descuentame-crawlee
+    env: docker
+    dockerfilePath: ./Dockerfile
+    autoDeploy: true
+    healthCheckPath: /docs
+    envVars:
+      - key: BLOB_READ_WRITE_TOKEN
+        sync: false
+      - key: API_BASE_URL
+        sync: false
+      - key: AUTH_JWT_SECRET
+        sync: false
+      - key: AUTH_JWT_ALGORITHM
+        value: HS256
+      - key: AUTH_JWT_EXPIRES_SECONDS
+        value: 3600
+      - key: INTERNAL_AUTH_EMAIL
+        value: crawler@descuenta.me
+      - key: INTERNAL_AUTH_SUB
+        value: internal-crawler
