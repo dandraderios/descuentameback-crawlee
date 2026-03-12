@@ -118,6 +118,12 @@ async def scrape_with_beautifulsoup(url: str) -> Dict[str, Any]:
     @crawler.router.default_handler
     async def request_handler(context: BeautifulSoupCrawlingContext) -> None:
         logger.info("🕷️ BeautifulSoup procesando respuesta | url=%s", context.request.url)
+        html_preview = str(context.soup)[:500].replace("\n", " ").replace("\r", " ")
+        logger.info(
+            "🕷️ BeautifulSoup html preview | url=%s html_500=%s",
+            context.request.url,
+            html_preview,
+        )
         parsed = {
             "url": context.request.url,
             "title": context.soup.title.string if context.soup.title else None,
@@ -185,6 +191,8 @@ async def scrape_with_playwright(url: str) -> Dict[str, Any]:
             await page.wait_for_timeout(3500)
             html = await page.content()
             soup = BeautifulSoup(html, "html.parser")
+            html_preview = html[:500].replace("\n", " ").replace("\r", " ")
+            logger.info("🎭 Playwright html preview | url=%s html_500=%s", url, html_preview)
             elapsed = time.perf_counter() - started_at
             logger.info("🎭 Playwright cargo pagina | url=%s elapsed=%.2fs", url, elapsed)
             return {
