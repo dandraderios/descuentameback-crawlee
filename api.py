@@ -869,6 +869,10 @@ async def run_crawler(
     crawler_options = dict(
         max_requests_per_crawl=1,  # Solo 1 request
         max_request_retries=0,
+        retry_on_blocked=False,
+        use_session_pool=False,
+        goto_options={"wait_until": "domcontentloaded"},
+        navigation_timeout=timedelta(seconds=90),
         # Eliminamos max_concurrency y enable_autoscaled_pool que causaban error
     )
 
@@ -897,9 +901,6 @@ async def run_crawler(
         }
         crawler_options.update(
             {
-                "retry_on_blocked": False,
-                "use_session_pool": False,
-                "goto_options": {"wait_until": "domcontentloaded"},
                 "navigation_timeout": timedelta(seconds=120),
             }
         )
@@ -938,9 +939,14 @@ async def run_crawler(
         if handler.needs_html:
             try:
                 try:
-                    await context.page.wait_for_load_state("networkidle", timeout=30000)
+                    await context.page.wait_for_load_state(
+                        "domcontentloaded", timeout=15000
+                    )
                 except Exception:
-                    context.log.warning("⚠️ networkidle timeout, continuo igual")
+                    context.log.warning(
+                        "⚠️ domcontentloaded post-goto timeout, continuo igual"
+                    )
+                await context.page.wait_for_timeout(2000)
                 if handler.html_wait_ms > 0:
                     await context.page.wait_for_timeout(handler.html_wait_ms)
                 html = await context.page.content()
