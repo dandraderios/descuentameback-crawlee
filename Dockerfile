@@ -6,6 +6,8 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY api.py ./
+COPY stores ./stores
+COPY scraping_config.json ./
 
 ENV PYTHONUNBUFFERED=1
 ENV PORT=10000
