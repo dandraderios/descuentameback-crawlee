@@ -21,6 +21,8 @@ from crawlee.crawlers import (
     PlaywrightCrawler,
     PlaywrightCrawlingContext,
 )
+from crawlee.http_clients import ImpitHttpClient
+from crawlee.proxy_configuration import ProxyConfiguration
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 
@@ -31,6 +33,19 @@ logger = logging.getLogger("api")
 
 SUPPORTED_STORES = {"falabella", "meli", "mercadolibre", "paris", "ripley"}
 PRICE_CHECKER_TOKEN = os.getenv("PRICE_CHECKER_TOKEN", "").strip()
+BEAUTIFULSOUP_PROXY_URLS = [
+    url.strip()
+    for url in os.getenv("BEAUTIFULSOUP_PROXY_URLS", "").split(",")
+    if url.strip()
+]
+PLAYWRIGHT_CRAWLER_PROXY_URLS = [
+    url.strip()
+    for url in os.getenv("PLAYWRIGHT_CRAWLER_PROXY_URLS", "").split(",")
+    if url.strip()
+]
+PLAYWRIGHT_PROXY_SERVER = os.getenv("PLAYWRIGHT_PROXY_SERVER", "").strip()
+PLAYWRIGHT_PROXY_USERNAME = os.getenv("PLAYWRIGHT_PROXY_USERNAME", "").strip()
+PLAYWRIGHT_PROXY_PASSWORD = os.getenv("PLAYWRIGHT_PROXY_PASSWORD", "").strip()
 
 
 class ProductPriceCheckRequest(BaseModel):
@@ -100,6 +115,45 @@ def require_internal_token(x_internal_token: Optional[str] = Header(default=None
         raise HTTPException(status_code=401, detail="x-internal-token invalido")
 
 
+def build_beautifulsoup_proxy_configuration() -> Optional[ProxyConfiguration]:
+    if not BEAUTIFULSOUP_PROXY_URLS:
+        logger.info("🌐 BeautifulSoup sin proxy configurado")
+        return None
+    logger.info(
+        "🌐 BeautifulSoup proxies configurados | count=%s",
+        len(BEAUTIFULSOUP_PROXY_URLS),
+    )
+    return ProxyConfiguration(proxy_urls=BEAUTIFULSOUP_PROXY_URLS)
+
+
+def build_playwright_proxy_settings() -> Optional[Dict[str, str]]:
+    if not PLAYWRIGHT_PROXY_SERVER:
+        logger.info("🌐 Playwright sin proxy configurado")
+        return None
+    proxy_settings = {"server": PLAYWRIGHT_PROXY_SERVER}
+    if PLAYWRIGHT_PROXY_USERNAME:
+        proxy_settings["username"] = PLAYWRIGHT_PROXY_USERNAME
+    if PLAYWRIGHT_PROXY_PASSWORD:
+        proxy_settings["password"] = PLAYWRIGHT_PROXY_PASSWORD
+    logger.info(
+        "🌐 Playwright proxy configurado | server=%s has_auth=%s",
+        PLAYWRIGHT_PROXY_SERVER,
+        bool(PLAYWRIGHT_PROXY_USERNAME or PLAYWRIGHT_PROXY_PASSWORD),
+    )
+    return proxy_settings
+
+
+def build_playwright_crawler_proxy_configuration() -> Optional[ProxyConfiguration]:
+    if not PLAYWRIGHT_CRAWLER_PROXY_URLS:
+        logger.info("🌐 PlaywrightCrawler sin lista de proxies configurada")
+        return None
+    logger.info(
+        "🌐 PlaywrightCrawler proxies configurados | count=%s",
+        len(PLAYWRIGHT_CRAWLER_PROXY_URLS),
+    )
+    return ProxyConfiguration(proxy_urls=PLAYWRIGHT_CRAWLER_PROXY_URLS)
+
+
 def has_meaningful_page_data(data: Dict[str, Any]) -> bool:
     if not isinstance(data, dict):
         return False
@@ -113,23 +167,36 @@ def has_meaningful_page_data(data: Dict[str, Any]) -> bool:
 async def scrape_with_beautifulsoup(url: str) -> Dict[str, Any]:
     started_at = time.perf_counter()
     logger.info("🕷️ Estrategia BeautifulSoupCrawler | url=%s", url)
+    logger.info("🕷️ BeautifulSoup timeout configurado | request_timeout=10s")
     result: Dict[str, Any] = {
         "url": url,
         "title": None,
         "h1s": [],
         "h2s": [],
         "h3s": [],
+        "_proxy_used": "none",
+        "_error": None,
     }
     crawler = BeautifulSoupCrawler(
         max_request_retries=1,
         request_handler_timeout=timedelta(seconds=30),
         max_requests_per_crawl=1,
+        proxy_configuration=build_beautifulsoup_proxy_configuration(),
+        http_client=ImpitHttpClient(timeout=10),
     )
     done = asyncio.get_running_loop().create_future()
+    attempt_counter = {"count": 0}
 
     @crawler.router.default_handler
     async def request_handler(context: BeautifulSoupCrawlingContext) -> None:
-        logger.info("🕷️ BeautifulSoup procesando respuesta | url=%s", context.request.url)
+        attempt_counter["count"] += 1
+        proxy_url = getattr(getattr(context, "proxy_info", None), "url", None)
+        logger.info(
+            "🕷️ BeautifulSoup procesando respuesta | url=%s attempt=%s proxy=%s",
+            context.request.url,
+            attempt_counter["count"],
+            proxy_url or "none",
+        )
         html_preview = str(context.soup)[:500].replace("\n", " ").replace("\r", " ")
         logger.info(
             "🕷️ BeautifulSoup html preview | url=%s html_500=%s",
@@ -142,6 +209,8 @@ async def scrape_with_beautifulsoup(url: str) -> Dict[str, Any]:
             "h1s": [h1.text for h1 in context.soup.find_all("h1")],
             "h2s": [h2.text for h2 in context.soup.find_all("h2")],
             "h3s": [h3.text for h3 in context.soup.find_all("h3")],
+            "_proxy_used": proxy_url or "none",
+            "_error": None,
         }
         if not done.done():
             done.set_result(parsed)
@@ -153,11 +222,43 @@ async def scrape_with_beautifulsoup(url: str) -> Dict[str, Any]:
     try:
         await crawler.run([url])
         elapsed = time.perf_counter() - started_at
-        logger.info("🕷️ BeautifulSoupCrawler completado | url=%s elapsed=%.2fs", url, elapsed)
+        logger.info(
+            "🕷️ BeautifulSoupCrawler completado | url=%s attempts=%s elapsed=%.2fs",
+            url,
+            attempt_counter["count"],
+            elapsed,
+        )
+        if not done.done():
+            result["_error"] = "no_response_processed"
+            logger.warning(
+                "⚠️ BeautifulSoupCrawler termino sin procesar respuesta | url=%s attempts=%s elapsed=%.2fs",
+                url,
+                attempt_counter["count"],
+                elapsed,
+            )
+            done.set_result(result)
+    except asyncio.CancelledError:
+        elapsed = time.perf_counter() - started_at
+        result["_error"] = "cancelled"
+        logger.warning(
+            "⚠️ BeautifulSoupCrawler cancelado | url=%s attempts=%s elapsed=%.2fs",
+            url,
+            attempt_counter["count"],
+            elapsed,
+        )
+        if not done.done():
+            done.set_result(result)
     except Exception as exc:
         elapsed = time.perf_counter() - started_at
+        error_name = exc.__class__.__name__.lower()
+        result["_error"] = error_name or "beautifulsoup_error"
         logger.warning("⚠️ BeautifulSoupCrawler fallo para %s: %s", url, exc)
-        logger.warning("⚠️ BeautifulSoupCrawler duracion con fallo | url=%s elapsed=%.2fs", url, elapsed)
+        logger.warning(
+            "⚠️ BeautifulSoupCrawler duracion con fallo | url=%s attempts=%s elapsed=%.2fs",
+            url,
+            attempt_counter["count"],
+            elapsed,
+        )
         if not done.done():
             done.set_result(result)
 
@@ -169,6 +270,12 @@ async def scrape_with_beautifulsoup(url: str) -> Dict[str, Any]:
 async def scrape_with_playwright(url: str) -> Dict[str, Any]:
     started_at = time.perf_counter()
     logger.info("🎭 Estrategia Playwright | url=%s", url)
+    proxy_settings = build_playwright_proxy_settings()
+    logger.info(
+        "🎭 Playwright usando proxy | url=%s proxy=%s",
+        url,
+        (proxy_settings or {}).get("server", "none"),
+    )
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
@@ -177,6 +284,7 @@ async def scrape_with_playwright(url: str) -> Dict[str, Any]:
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
             ],
+            proxy=proxy_settings,
         )
         context = await browser.new_context(
             locale="es-CL",
@@ -233,6 +341,7 @@ async def scrape_with_playwright(url: str) -> Dict[str, Any]:
 async def scrape_with_playwright_crawler(url: str) -> Dict[str, Any]:
     started_at = time.perf_counter()
     logger.info("🎭 Estrategia PlaywrightCrawler | url=%s", url)
+    proxy_configuration = build_playwright_crawler_proxy_configuration()
     result: Dict[str, Any] = {
         "url": url,
         "title": None,
@@ -264,12 +373,18 @@ async def scrape_with_playwright_crawler(url: str) -> Dict[str, Any]:
             "viewport": {"width": 1366, "height": 768},
             "extra_http_headers": {"accept-language": "es-CL,es;q=0.9,en;q=0.8"},
         },
+        proxy_configuration=proxy_configuration,
     )
     done = asyncio.get_running_loop().create_future()
 
     @crawler.router.default_handler
     async def request_handler(context: PlaywrightCrawlingContext) -> None:
-        logger.info("🎭 PlaywrightCrawler procesando respuesta | url=%s", context.request.url)
+        proxy_url = getattr(getattr(context, "proxy_info", None), "url", None)
+        logger.info(
+            "🎭 PlaywrightCrawler procesando respuesta | url=%s proxy=%s",
+            context.request.url,
+            proxy_url or "none",
+        )
         await context.page.add_init_script(
             """
             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -337,14 +452,17 @@ async def scrape_current_page_data(store_id: str, product_url: str) -> Dict[str,
         soup_data = await scrape_with_beautifulsoup(product_url)
         if has_meaningful_page_data(soup_data):
             logger.info(
-                "🕷️ Ripley resuelto con BeautifulSoup | url=%s",
+                "🕷️ Ripley resuelto con BeautifulSoup | url=%s proxy=%s",
                 product_url,
+                soup_data.get("_proxy_used", "none"),
             )
             soup_data["_strategy"] = "beautifulsoup"
             return soup_data
         logger.warning(
-            "⚠️ Ripley sin data util con BeautifulSoup, usando fallback PlaywrightCrawler | url=%s",
+            "⚠️ Ripley sin data util con BeautifulSoup, usando fallback PlaywrightCrawler | url=%s reason=%s proxy=%s",
             product_url,
+            soup_data.get("_error", "empty_response"),
+            soup_data.get("_proxy_used", "none"),
         )
         data = await scrape_with_playwright_crawler(product_url)
         data["_strategy"] = "beautifulsoup->playwright-crawler"
