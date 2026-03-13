@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import time
@@ -30,12 +31,18 @@ load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("api")
+APP_STARTED_AT = time.time()
 
 SUPPORTED_STORES = {"falabella", "meli", "mercadolibre", "paris", "ripley"}
 PRICE_CHECKER_TOKEN = os.getenv("PRICE_CHECKER_TOKEN", "").strip()
 BEAUTIFULSOUP_PROXY_URLS = [
     url.strip()
     for url in os.getenv("BEAUTIFULSOUP_PROXY_URLS", "").split(",")
+    if url.strip()
+]
+PLAYWRIGHT_PROXY_URLS = [
+    url.strip()
+    for url in os.getenv("PLAYWRIGHT_PROXY_URLS", "").split(",")
     if url.strip()
 ]
 PLAYWRIGHT_CRAWLER_PROXY_URLS = [
@@ -46,12 +53,46 @@ PLAYWRIGHT_CRAWLER_PROXY_URLS = [
 PLAYWRIGHT_PROXY_SERVER = os.getenv("PLAYWRIGHT_PROXY_SERVER", "").strip()
 PLAYWRIGHT_PROXY_USERNAME = os.getenv("PLAYWRIGHT_PROXY_USERNAME", "").strip()
 PLAYWRIGHT_PROXY_PASSWORD = os.getenv("PLAYWRIGHT_PROXY_PASSWORD", "").strip()
+ENVIRONMENT = os.getenv("ENVIRONMENT", "").strip().lower()
+SCRAPING_CONFIG_PATH = os.getenv("SCRAPING_CONFIG_PATH", "scraping_config.json").strip()
 
 
 class ProductPriceCheckRequest(BaseModel):
     batch_size: int = Field(1, ge=1, le=50)
     store: Optional[str] = None
     product_id: Optional[str] = None
+
+
+def load_scraping_config() -> Dict[str, Any]:
+    default_config: Dict[str, Any] = {
+        "defaults": {
+            "beautifulsoup": {"use_proxy": True, "use_fast_http_client": True},
+            "playwright": {"use_proxy": True},
+            "playwright_crawler": {"use_proxy": True},
+        },
+        "stores": {
+            "falabella": {"primary_strategy": "beautifulsoup"},
+            "paris": {"primary_strategy": "beautifulsoup"},
+            "meli": {"primary_strategy": "playwright"},
+            "mercadolibre": {"primary_strategy": "playwright"},
+            "ripley": {
+                "primary_strategy": "beautifulsoup",
+                "fallback_strategy": "playwright_crawler",
+            },
+        },
+    }
+    try:
+        with open(SCRAPING_CONFIG_PATH, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        logger.info("🗺️ Scraping config cargada | path=%s", SCRAPING_CONFIG_PATH)
+        return loaded
+    except Exception as exc:
+        logger.warning(
+            "⚠️ No se pudo cargar scraping config, usando defaults | path=%s error=%s",
+            SCRAPING_CONFIG_PATH,
+            exc,
+        )
+        return default_config
 
 
 class MongoDB:
@@ -83,6 +124,7 @@ class MongoDB:
 
 
 mongo_db = MongoDB()
+SCRAPING_CONFIG = load_scraping_config()
 app = FastAPI(title="Descuentame Price Checker")
 
 app.add_middleware(
@@ -115,7 +157,25 @@ def require_internal_token(x_internal_token: Optional[str] = Header(default=None
         raise HTTPException(status_code=401, detail="x-internal-token invalido")
 
 
+def get_strategy_settings(strategy: str) -> Dict[str, Any]:
+    defaults = SCRAPING_CONFIG.get("defaults") or {}
+    return dict(defaults.get(strategy) or {})
+
+
+def get_store_scraping_settings(store_id: str) -> Dict[str, Any]:
+    normalized_store = normalize_store(store_id)
+    stores = SCRAPING_CONFIG.get("stores") or {}
+    return dict(stores.get(normalized_store) or stores.get(store_id) or {})
+
+
 def build_beautifulsoup_proxy_configuration() -> Optional[ProxyConfiguration]:
+    strategy_settings = get_strategy_settings("beautifulsoup")
+    if ENVIRONMENT == "dev":
+        logger.info("🌐 BeautifulSoup proxy deshabilitado en ENVIRONMENT=dev")
+        return None
+    if not strategy_settings.get("use_proxy", True):
+        logger.info("🌐 BeautifulSoup proxy deshabilitado por configuracion")
+        return None
     if not BEAUTIFULSOUP_PROXY_URLS:
         logger.info("🌐 BeautifulSoup sin proxy configurado")
         return None
@@ -126,7 +186,34 @@ def build_beautifulsoup_proxy_configuration() -> Optional[ProxyConfiguration]:
     return ProxyConfiguration(proxy_urls=BEAUTIFULSOUP_PROXY_URLS)
 
 
+def build_beautifulsoup_http_client() -> Optional[ImpitHttpClient]:
+    strategy_settings = get_strategy_settings("beautifulsoup")
+    if ENVIRONMENT == "dev":
+        logger.info("🕷️ BeautifulSoup usando http client por defecto en ENVIRONMENT=dev")
+        return None
+    if not strategy_settings.get("use_fast_http_client", True):
+        logger.info("🕷️ BeautifulSoup usando http client por defecto por configuracion")
+        return None
+    logger.info("🕷️ BeautifulSoup usando ImpitHttpClient con timeout=10s")
+    return ImpitHttpClient(timeout=10)
+
+
 def build_playwright_proxy_settings() -> Optional[Dict[str, str]]:
+    strategy_settings = get_strategy_settings("playwright")
+    if ENVIRONMENT == "dev":
+        logger.info("🌐 Playwright proxy deshabilitado en ENVIRONMENT=dev")
+        return None
+    if not strategy_settings.get("use_proxy", True):
+        logger.info("🌐 Playwright proxy deshabilitado por configuracion")
+        return None
+    if PLAYWRIGHT_PROXY_URLS:
+        selected_proxy_url = PLAYWRIGHT_PROXY_URLS[0]
+        logger.info(
+            "🌐 Playwright proxy configurado desde lista | selected=%s count=%s",
+            selected_proxy_url,
+            len(PLAYWRIGHT_PROXY_URLS),
+        )
+        return {"server": selected_proxy_url}
     if not PLAYWRIGHT_PROXY_SERVER:
         logger.info("🌐 Playwright sin proxy configurado")
         return None
@@ -144,6 +231,13 @@ def build_playwright_proxy_settings() -> Optional[Dict[str, str]]:
 
 
 def build_playwright_crawler_proxy_configuration() -> Optional[ProxyConfiguration]:
+    strategy_settings = get_strategy_settings("playwright_crawler")
+    if ENVIRONMENT == "dev":
+        logger.info("🌐 PlaywrightCrawler proxy deshabilitado en ENVIRONMENT=dev")
+        return None
+    if not strategy_settings.get("use_proxy", True):
+        logger.info("🌐 PlaywrightCrawler proxy deshabilitado por configuracion")
+        return None
     if not PLAYWRIGHT_CRAWLER_PROXY_URLS:
         logger.info("🌐 PlaywrightCrawler sin lista de proxies configurada")
         return None
@@ -167,7 +261,6 @@ def has_meaningful_page_data(data: Dict[str, Any]) -> bool:
 async def scrape_with_beautifulsoup(url: str) -> Dict[str, Any]:
     started_at = time.perf_counter()
     logger.info("🕷️ Estrategia BeautifulSoupCrawler | url=%s", url)
-    logger.info("🕷️ BeautifulSoup timeout configurado | request_timeout=10s")
     result: Dict[str, Any] = {
         "url": url,
         "title": None,
@@ -182,7 +275,7 @@ async def scrape_with_beautifulsoup(url: str) -> Dict[str, Any]:
         request_handler_timeout=timedelta(seconds=30),
         max_requests_per_crawl=1,
         proxy_configuration=build_beautifulsoup_proxy_configuration(),
-        http_client=ImpitHttpClient(timeout=10),
+        http_client=build_beautifulsoup_http_client(),
     )
     done = asyncio.get_running_loop().create_future()
     attempt_counter = {"count": 0}
@@ -436,19 +529,22 @@ async def scrape_with_playwright_crawler(url: str) -> Dict[str, Any]:
 
 async def scrape_current_page_data(store_id: str, product_url: str) -> Dict[str, Any]:
     normalized_store = normalize_store(store_id)
-    strategy = "playwright" if normalized_store == "meli" else "beautifulsoup"
+    store_settings = get_store_scraping_settings(normalized_store)
+    primary_strategy = store_settings.get("primary_strategy", "beautifulsoup")
+    fallback_strategy = store_settings.get("fallback_strategy")
     logger.info(
-        "🔀 Estrategia seleccionada | store=%s normalized_store=%s strategy=%s url=%s",
+        "🔀 Estrategia seleccionada | store=%s normalized_store=%s primary=%s fallback=%s url=%s",
         store_id,
         normalized_store,
-        strategy,
+        primary_strategy,
+        fallback_strategy or "none",
         product_url,
     )
-    if normalized_store == "meli":
+    if primary_strategy == "playwright":
         data = await scrape_with_playwright(product_url)
         data["_strategy"] = "playwright"
         return data
-    if normalized_store == "ripley":
+    if normalized_store == "ripley" and primary_strategy == "beautifulsoup":
         soup_data = await scrape_with_beautifulsoup(product_url)
         if has_meaningful_page_data(soup_data):
             logger.info(
@@ -464,12 +560,19 @@ async def scrape_current_page_data(store_id: str, product_url: str) -> Dict[str,
             soup_data.get("_error", "empty_response"),
             soup_data.get("_proxy_used", "none"),
         )
-        data = await scrape_with_playwright_crawler(product_url)
-        data["_strategy"] = "beautifulsoup->playwright-crawler"
-        return data
-    if normalized_store in {"falabella", "paris"}:
+        if fallback_strategy == "playwright_crawler":
+            data = await scrape_with_playwright_crawler(product_url)
+            data["_strategy"] = "beautifulsoup->playwright-crawler"
+            return data
+        soup_data["_strategy"] = "beautifulsoup"
+        return soup_data
+    if primary_strategy == "beautifulsoup":
         data = await scrape_with_beautifulsoup(product_url)
         data["_strategy"] = "beautifulsoup"
+        return data
+    if primary_strategy == "playwright_crawler":
+        data = await scrape_with_playwright_crawler(product_url)
+        data["_strategy"] = "playwright-crawler"
         return data
     return {
         "url": product_url,
@@ -616,12 +719,14 @@ async def run_price_checker_sync(request: ProductPriceCheckRequest) -> Dict[str,
 
 @app.get("/health/check")
 async def health_check() -> Dict[str, Any]:
+    uptime_seconds = int(time.time() - APP_STARTED_AT)
     return {
         "success": True,
         "data": {
             "status": "healthy",
             "db": "connected" if mongo_db.client else "disconnected",
             "timestamp": datetime.now().timestamp(),
+            "uptime_seconds": uptime_seconds,
         },
         "error": None,
         "message": "Health check",

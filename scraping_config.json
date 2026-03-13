@@ -1,0 +1,32 @@
+{
+  "defaults": {
+    "beautifulsoup": {
+      "use_proxy": true,
+      "use_fast_http_client": true
+    },
+    "playwright": {
+      "use_proxy": true
+    },
+    "playwright_crawler": {
+      "use_proxy": true
+    }
+  },
+  "stores": {
+    "falabella": {
+      "primary_strategy": "beautifulsoup"
+    },
+    "paris": {
+      "primary_strategy": "beautifulsoup"
+    },
+    "meli": {
+      "primary_strategy": "playwright"
+    },
+    "mercadolibre": {
+      "primary_strategy": "playwright"
+    },
+    "ripley": {
+      "primary_strategy": "beautifulsoup",
+      "fallback_strategy": "playwright_crawler"
+    }
+  }
+}
