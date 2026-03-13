@@ -13,7 +13,13 @@
   },
   "stores": {
     "falabella": {
-      "primary_strategy": "beautifulsoup"
+      "primary_strategy": "beautifulsoup",
+      "beautifulsoup": {
+        "use_proxy": false
+      },
+      "playwright_crawler": {
+        "use_proxy": false
+      }
     },
     "paris": {
       "primary_strategy": "beautifulsoup"
