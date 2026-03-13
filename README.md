@@ -151,11 +151,27 @@ Body:
 Campos:
 
 - `batch_size`: cantidad de productos a procesar
-- `store`: filtro opcional por tienda
+- `store`: filtro opcional por tienda. Si no se envía, el servicio selecciona productos automáticamente
 - `product_id`: filtro opcional por producto específico
 - `keep_published_on_better_price`: si es `true`, evita archivar cuando el descuento es `>= 50%` y el mejor precio mejora la DB
 - `async_mode`: si es `true` y `ENVIRONMENT=prod`, intenta encolar en QStash hacia el worker interno y responder rápido
 - `allow_sync_fallback`: si QStash falla, permite ejecutar el check síncrono en la misma request
+
+Selección automática cuando no mandas `store`:
+
+- busca productos con `status != archived`
+- ordena por `price_checked_at` y luego por `created_at`
+- eso prioriza productos no chequeados o chequeados hace más tiempo
+- igual permite recheckear productos ya chequeados
+- toma más candidatos que el `batch_size` pedido
+- salta tiendas no implementadas para no frenar el flujo
+- procesa hasta completar el `batch_size` con tiendas soportadas
+
+Si en los candidatos solo aparecen tiendas no implementadas:
+
+- responde sin romper el flujo
+- informa `not_implemented`
+- devuelve un resultado con mensaje `price-check no implementado para esta tienda`
 
 ### `POST /api/v1/products/price-check/worker`
 

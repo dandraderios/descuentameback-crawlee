@@ -356,6 +356,8 @@ async def run_price_checker_sync(request: ProductPriceCheckRequest) -> Dict[str,
             return {
                 "summary": {
                     "processed": 0,
+                    "success": 0,
+                    "errors": 0,
                     "vigente": 0,
                     "expirado": 0,
                     "no_checkeado": 0,
@@ -369,18 +371,6 @@ async def run_price_checker_sync(request: ProductPriceCheckRequest) -> Dict[str,
                 ],
             }
         query["store.store_id"] = {"$in": requested_store_values}
-    else:
-        query["store.store_id"] = {
-            "$in": sorted(
-                {
-                    "falabella",
-                    "paris",
-                    "ripley",
-                    "meli",
-                    "mercadolibre",
-                }
-            )
-        }
 
     if requested_product_id:
         query["product_id"] = requested_product_id
@@ -401,14 +391,81 @@ async def run_price_checker_sync(request: ProductPriceCheckRequest) -> Dict[str,
         "status": 1,
     }
     limit = 1 if requested_product_id else request.batch_size
-    products = list(
+    candidate_limit = limit if (requested_store or requested_product_id) else max(limit * 5, 25)
+    candidate_products = list(
         mongo_db.products.find(query, projection)
         .sort([("price_checked_at", 1), ("created_at", 1)])
-        .limit(limit)
+        .limit(candidate_limit)
     )
 
+    if not candidate_products:
+        return {
+            "summary": {
+                "processed": 0,
+                "success": 0,
+                "errors": 0,
+                "vigente": 0,
+                "expirado": 0,
+                "no_checkeado": 0,
+                "not_implemented": 0,
+            },
+            "results": [],
+        }
+
+    skipped_unsupported: List[Dict[str, Any]] = []
+    products: List[Dict[str, Any]] = []
+    for product in candidate_products:
+        store_id = normalize_store(((product.get("store") or {}).get("store_id") or "").strip())
+        if store_id in SUPPORTED_STORES:
+            products.append(product)
+        else:
+            skipped_unsupported.append(
+                {
+                    "product_id": str(product.get("product_id") or ""),
+                    "store": store_id or "unknown",
+                    "message": "price-check no implementado para esta tienda",
+                }
+            )
+        if len(products) >= limit:
+            break
+
     if not products:
-        return {"summary": {"processed": 0, "vigente": 0, "expirado": 0, "no_checkeado": 0, "not_implemented": 0}, "results": []}
+        if skipped_unsupported:
+            logger.info(
+                "ℹ️ No se encontraron tiendas implementadas en los candidatos | skipped=%s",
+                [item["store"] for item in skipped_unsupported[:5]],
+            )
+            return {
+                "summary": {
+                    "processed": 0,
+                    "success": 0,
+                    "errors": 0,
+                    "vigente": 0,
+                    "expirado": 0,
+                    "no_checkeado": 0,
+                    "not_implemented": 1,
+                },
+                "results": [skipped_unsupported[0]],
+            }
+        return {
+            "summary": {
+                "processed": 0,
+                "success": 0,
+                "errors": 0,
+                "vigente": 0,
+                "expirado": 0,
+                "no_checkeado": 0,
+                "not_implemented": 0,
+            },
+            "results": [],
+        }
+
+    if skipped_unsupported and not requested_store:
+        logger.info(
+            "ℹ️ Se omitieron productos de tiendas no implementadas para no frenar el flujo | skipped=%s selected=%s",
+            [item["store"] for item in skipped_unsupported[:5]],
+            [normalize_store((((item.get('store') or {})).get('store_id') or '').strip()) for item in products],
+        )
 
     results: List[Dict[str, Any]] = []
     now = datetime.now(timezone.utc)
