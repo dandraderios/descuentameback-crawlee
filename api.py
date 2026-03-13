@@ -587,13 +587,36 @@ async def run_price_checker_sync(request: ProductPriceCheckRequest) -> Dict[str,
                         product_id,
                         decision_summary["unchecked_reasons"],
                     )
+            else:
+                strategy_used = (result_item["data"] or {}).get("_strategy", "unknown")
+                data_error = (result_item["data"] or {}).get("_error")
+                proxy_used = (result_item["data"] or {}).get("_proxy_used", "none")
+                non_archive_reasons = [
+                    "no se detectaron precios comparables en el HTML scrapeado",
+                    f"strategy={strategy_used}",
+                    f"proxy={proxy_used}",
+                ]
+                if data_error:
+                    non_archive_reasons.append(f"scraper_error={data_error}")
+                result_item["decision_summary"] = {
+                    "expired_reasons": [],
+                    "vigente_reasons": [],
+                    "unchecked_reasons": non_archive_reasons,
+                }
+                logger.info(
+                    "ℹ️ Producto no se archiva porque no hubo precios para comparar | product_id=%s razones=%s",
+                    product_id,
+                    non_archive_reasons,
+                )
 
             elapsed = time.perf_counter() - product_started_at
             logger.info(
-                "✅ Scraping completado | product_id=%s store=%s strategy=%s elapsed=%.2fs",
+                "✅ Scraping completado | product_id=%s store=%s strategy=%s price_status=%s archived=%s elapsed=%.2fs",
                 product_id,
                 store_id,
                 (result_item["data"] or {}).get("_strategy", "unknown"),
+                result_item["price_status"],
+                result_item["archived"],
                 elapsed,
             )
         except Exception as exc:
