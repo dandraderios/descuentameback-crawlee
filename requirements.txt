@@ -6,3 +6,4 @@ python-dotenv
 pymongo==4.11.3
 beautifulsoup4==4.12.3
 lxml
+httpx

@@ -10,3 +10,15 @@ services:
         sync: false
       - key: PRICE_CHECKER_TOKEN
         sync: false
+      - key: ENVIRONMENT
+        value: prod
+      - key: QSTASH_TOKEN
+        sync: false
+      - key: QSTASH_URL
+        value: https://qstash.upstash.io
+      - key: QSTASH_TIMEOUT_SECONDS
+        value: 1.5
+      - key: QSTASH_RETRIES
+        value: 2
+      - key: PRICE_CHECK_RUN_URL
+        sync: false

@@ -17,6 +17,12 @@ La estrategia de scraping depende de la tienda:
 - `mercadolibre` / `meli`: Playwright directo
 - `ripley`: primero `BeautifulSoupCrawler`, y si no obtiene data útil hace fallback a `PlaywrightCrawler`
 
+El endpoint también puede correr en modo asíncrono para producción:
+
+- responde rápido `200`
+- encola el trabajo en QStash
+- luego QStash invoca el worker interno con ejecución síncrona
+
 ## Lógica Final por Tienda
 
 ### `falabella`
@@ -130,7 +136,7 @@ Health check básico del servicio y del estado de conexión a Mongo.
 
 ### `POST /api/v1/products/price-check/run`
 
-Busca productos en la colección `products` y scrapea su página de mercado.
+Endpoint público. Busca productos en la colección `products` y scrapea su página de mercado.
 
 Body:
 
@@ -147,6 +153,16 @@ Campos:
 - `batch_size`: cantidad de productos a procesar
 - `store`: filtro opcional por tienda
 - `product_id`: filtro opcional por producto específico
+- `keep_published_on_better_price`: si es `true`, evita archivar cuando el descuento es `>= 50%` y el mejor precio mejora la DB
+- `async_mode`: si es `true` y `ENVIRONMENT=prod`, intenta encolar en QStash hacia el worker interno y responder rápido
+- `allow_sync_fallback`: si QStash falla, permite ejecutar el check síncrono en la misma request
+
+### `POST /api/v1/products/price-check/worker`
+
+Endpoint interno para QStash. Ejecuta siempre el procesamiento síncrono.
+
+- no está pensado para clientes públicos
+- requiere el mismo `x-internal-token` cuando `PRICE_CHECKER_TOKEN` está configurado
 
 Si `PRICE_CHECKER_TOKEN` está configurado, debes enviar:
 
@@ -187,6 +203,21 @@ Ejemplo:
 }
 ```
 
+Si `async_mode=true` en producción, puede responder así:
+
+```json
+{
+  "success": true,
+  "message": "Price-check encolado",
+  "data": {
+    "queued": true,
+    "queue": "qstash",
+    "message_id": "msg_...",
+    "run_url": "https://tu-servicio/api/v1/products/price-check/worker"
+  }
+}
+```
+
 ## Variables de entorno
 
 Obligatoria:
@@ -205,6 +236,11 @@ PLAYWRIGHT_PROXY_SERVER=...
 PLAYWRIGHT_PROXY_USERNAME=...
 PLAYWRIGHT_PROXY_PASSWORD=...
 PLAYWRIGHT_CRAWLER_PROXY_URLS=...
+QSTASH_TOKEN=...
+QSTASH_URL=https://qstash.upstash.io
+QSTASH_TIMEOUT_SECONDS=1.5
+QSTASH_RETRIES=2
+PRICE_CHECK_RUN_URL=https://tu-servicio/api/v1/products/price-check/worker
 ```
 
 ## Desarrollo local
@@ -235,6 +271,21 @@ curl -X POST 'http://localhost:8003/api/v1/products/price-check/run' \
 
 Si no usas `PRICE_CHECKER_TOKEN`, elimina ese header.
 
+Ejemplo de request asíncrono para producción:
+
+```bash
+curl -X POST 'https://tu-servicio/api/v1/products/price-check/run' \
+  -H 'Content-Type: application/json' \
+  -H 'x-internal-token: TU_PRICE_CHECKER_TOKEN' \
+  -d '{
+    "batch_size": 1,
+    "store": "falabella",
+    "async_mode": true,
+    "allow_sync_fallback": true,
+    "keep_published_on_better_price": true
+  }'
+```
+
 ## Docker
 
 Construcción:
@@ -263,6 +314,9 @@ Variables necesarias en Render:
 
 - `MONGODB_URI`
 - `PRICE_CHECKER_TOKEN` opcional
+- `ENVIRONMENT=prod`
+- `QSTASH_TOKEN` si vas a usar encolado
+- `PRICE_CHECK_RUN_URL` recomendado en producción y apuntando al worker interno
 
 Health check configurado:
 

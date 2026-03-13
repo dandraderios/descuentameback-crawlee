@@ -1,31 +1,20 @@
-import asyncio
-import json
 import logging
 import os
 import time
-from datetime import datetime, timedelta
+import re
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
-from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException
+import httpx
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from pymongo import MongoClient
 from pymongo.collection import Collection
 from pymongo.errors import ConnectionFailure
-
-from crawlee.crawlers import (
-    BasicCrawlingContext,
-    BeautifulSoupCrawler,
-    BeautifulSoupCrawlingContext,
-    PlaywrightCrawler,
-    PlaywrightCrawlingContext,
-)
-from crawlee.http_clients import ImpitHttpClient
-from crawlee.proxy_configuration import ProxyConfiguration
-from playwright.async_api import TimeoutError as PlaywrightTimeoutError
-from playwright.async_api import async_playwright
+from stores import scrape_falabella, scrape_meli, scrape_paris, scrape_ripley
 
 load_dotenv()
 
@@ -35,64 +24,36 @@ APP_STARTED_AT = time.time()
 
 SUPPORTED_STORES = {"falabella", "meli", "mercadolibre", "paris", "ripley"}
 PRICE_CHECKER_TOKEN = os.getenv("PRICE_CHECKER_TOKEN", "").strip()
-BEAUTIFULSOUP_PROXY_URLS = [
-    url.strip()
-    for url in os.getenv("BEAUTIFULSOUP_PROXY_URLS", "").split(",")
-    if url.strip()
-]
-PLAYWRIGHT_PROXY_URLS = [
-    url.strip()
-    for url in os.getenv("PLAYWRIGHT_PROXY_URLS", "").split(",")
-    if url.strip()
-]
-PLAYWRIGHT_CRAWLER_PROXY_URLS = [
-    url.strip()
-    for url in os.getenv("PLAYWRIGHT_CRAWLER_PROXY_URLS", "").split(",")
-    if url.strip()
-]
-PLAYWRIGHT_PROXY_SERVER = os.getenv("PLAYWRIGHT_PROXY_SERVER", "").strip()
-PLAYWRIGHT_PROXY_USERNAME = os.getenv("PLAYWRIGHT_PROXY_USERNAME", "").strip()
-PLAYWRIGHT_PROXY_PASSWORD = os.getenv("PLAYWRIGHT_PROXY_PASSWORD", "").strip()
 ENVIRONMENT = os.getenv("ENVIRONMENT", "").strip().lower()
-SCRAPING_CONFIG_PATH = os.getenv("SCRAPING_CONFIG_PATH", "scraping_config.json").strip()
+QSTASH_URL = os.getenv("QSTASH_URL", "https://qstash.upstash.io").rstrip("/")
+QSTASH_TOKEN = os.getenv("QSTASH_TOKEN", "").strip()
+QSTASH_TIMEOUT_SECONDS = float(os.getenv("QSTASH_TIMEOUT_SECONDS", "1.5"))
+QSTASH_RETRIES = int(os.getenv("QSTASH_RETRIES", "2"))
+PRICE_CHECK_RUN_URL = os.getenv("PRICE_CHECK_RUN_URL", "").strip()
+PRICE_FIELDS = [
+    "current_price",
+    "old_price",
+    "cmr_price",
+    "card_price",
+    "cenco_card_price",
+    "ripley_card_price",
+    "discount",
+]
 
 
 class ProductPriceCheckRequest(BaseModel):
     batch_size: int = Field(1, ge=1, le=50)
     store: Optional[str] = None
     product_id: Optional[str] = None
-
-
-def load_scraping_config() -> Dict[str, Any]:
-    default_config: Dict[str, Any] = {
-        "defaults": {
-            "beautifulsoup": {"use_proxy": True, "use_fast_http_client": True},
-            "playwright": {"use_proxy": True},
-            "playwright_crawler": {"use_proxy": True},
-        },
-        "stores": {
-            "falabella": {"primary_strategy": "beautifulsoup"},
-            "paris": {"primary_strategy": "beautifulsoup"},
-            "meli": {"primary_strategy": "playwright"},
-            "mercadolibre": {"primary_strategy": "playwright"},
-            "ripley": {
-                "primary_strategy": "beautifulsoup",
-                "fallback_strategy": "playwright_crawler",
-            },
-        },
-    }
-    try:
-        with open(SCRAPING_CONFIG_PATH, "r", encoding="utf-8") as f:
-            loaded = json.load(f)
-        logger.info("🗺️ Scraping config cargada | path=%s", SCRAPING_CONFIG_PATH)
-        return loaded
-    except Exception as exc:
-        logger.warning(
-            "⚠️ No se pudo cargar scraping config, usando defaults | path=%s error=%s",
-            SCRAPING_CONFIG_PATH,
-            exc,
-        )
-        return default_config
+    keep_published_on_better_price: bool = False
+    async_mode: bool = Field(
+        default=False,
+        description="Si true, encola el trabajo y responde rapido",
+    )
+    allow_sync_fallback: bool = Field(
+        default=False,
+        description="Si la cola falla, permite ejecutar sincronamente",
+    )
 
 
 class MongoDB:
@@ -124,7 +85,6 @@ class MongoDB:
 
 
 mongo_db = MongoDB()
-SCRAPING_CONFIG = load_scraping_config()
 app = FastAPI(title="Descuentame Price Checker")
 
 app.add_middleware(
@@ -157,423 +117,220 @@ def require_internal_token(x_internal_token: Optional[str] = Header(default=None
         raise HTTPException(status_code=401, detail="x-internal-token invalido")
 
 
-def get_strategy_settings(strategy: str) -> Dict[str, Any]:
-    defaults = SCRAPING_CONFIG.get("defaults") or {}
-    return dict(defaults.get(strategy) or {})
-
-
-def get_store_scraping_settings(store_id: str) -> Dict[str, Any]:
-    normalized_store = normalize_store(store_id)
-    stores = SCRAPING_CONFIG.get("stores") or {}
-    return dict(stores.get(normalized_store) or stores.get(store_id) or {})
-
-
-def build_beautifulsoup_proxy_configuration() -> Optional[ProxyConfiguration]:
-    strategy_settings = get_strategy_settings("beautifulsoup")
-    if ENVIRONMENT == "dev":
-        logger.info("🌐 BeautifulSoup proxy deshabilitado en ENVIRONMENT=dev")
+def price_to_int(value: Optional[str]) -> Optional[int]:
+    if value in (None, "", [], {}):
         return None
-    if not strategy_settings.get("use_proxy", True):
-        logger.info("🌐 BeautifulSoup proxy deshabilitado por configuracion")
+    digits = re.sub(r"[^\d]", "", str(value))
+    if not digits:
         return None
-    if not BEAUTIFULSOUP_PROXY_URLS:
-        logger.info("🌐 BeautifulSoup sin proxy configurado")
-        return None
-    logger.info(
-        "🌐 BeautifulSoup proxies configurados | count=%s",
-        len(BEAUTIFULSOUP_PROXY_URLS),
-    )
-    return ProxyConfiguration(proxy_urls=BEAUTIFULSOUP_PROXY_URLS)
+    amount = int(digits)
+    return amount if amount > 0 else None
 
 
-def build_beautifulsoup_http_client() -> Optional[ImpitHttpClient]:
-    strategy_settings = get_strategy_settings("beautifulsoup")
-    if ENVIRONMENT == "dev":
-        logger.info("🕷️ BeautifulSoup usando http client por defecto en ENVIRONMENT=dev")
-        return None
-    if not strategy_settings.get("use_fast_http_client", True):
-        logger.info("🕷️ BeautifulSoup usando http client por defecto por configuracion")
-        return None
-    logger.info("🕷️ BeautifulSoup usando ImpitHttpClient con timeout=10s")
-    return ImpitHttpClient(timeout=10)
+def compare_prices(db_prices: Dict[str, Any], html_prices: Dict[str, Any]) -> tuple[str, Dict[str, str]]:
+    matches: Dict[str, str] = {}
+    statuses: List[str] = []
+
+    for field in PRICE_FIELDS:
+        db_raw = db_prices.get(field)
+        html_raw = html_prices.get(field)
+        db_int = price_to_int(db_raw)
+        html_int = price_to_int(html_raw)
+
+        if db_int is None or html_int is None:
+            status = "no-checkeado"
+        elif db_int == html_int:
+            status = "vigente"
+        else:
+            status = "expirado"
+
+        matches[field] = status
+        statuses.append(status)
+
+    if "expirado" in statuses:
+        return "expirado", matches
+    if "vigente" in statuses:
+        return "vigente", matches
+    return "no-checkeado", matches
 
 
-def build_playwright_proxy_settings() -> Optional[Dict[str, str]]:
-    strategy_settings = get_strategy_settings("playwright")
-    if ENVIRONMENT == "dev":
-        logger.info("🌐 Playwright proxy deshabilitado en ENVIRONMENT=dev")
-        return None
-    if not strategy_settings.get("use_proxy", True):
-        logger.info("🌐 Playwright proxy deshabilitado por configuracion")
-        return None
-    if PLAYWRIGHT_PROXY_URLS:
-        selected_proxy_url = PLAYWRIGHT_PROXY_URLS[0]
-        logger.info(
-            "🌐 Playwright proxy configurado desde lista | selected=%s count=%s",
-            selected_proxy_url,
-            len(PLAYWRIGHT_PROXY_URLS),
-        )
-        return {"server": selected_proxy_url}
-    if not PLAYWRIGHT_PROXY_SERVER:
-        logger.info("🌐 Playwright sin proxy configurado")
-        return None
-    proxy_settings = {"server": PLAYWRIGHT_PROXY_SERVER}
-    if PLAYWRIGHT_PROXY_USERNAME:
-        proxy_settings["username"] = PLAYWRIGHT_PROXY_USERNAME
-    if PLAYWRIGHT_PROXY_PASSWORD:
-        proxy_settings["password"] = PLAYWRIGHT_PROXY_PASSWORD
-    logger.info(
-        "🌐 Playwright proxy configurado | server=%s has_auth=%s",
-        PLAYWRIGHT_PROXY_SERVER,
-        bool(PLAYWRIGHT_PROXY_USERNAME or PLAYWRIGHT_PROXY_PASSWORD),
-    )
-    return proxy_settings
+def summarize_price_decision(
+    db_prices: Dict[str, Any],
+    html_prices: Dict[str, Any],
+    matches: Dict[str, str],
+) -> Dict[str, List[str]]:
+    expired_reasons: List[str] = []
+    vigente_reasons: List[str] = []
+    unchecked_reasons: List[str] = []
 
-
-def build_playwright_crawler_proxy_configuration() -> Optional[ProxyConfiguration]:
-    strategy_settings = get_strategy_settings("playwright_crawler")
-    if ENVIRONMENT == "dev":
-        logger.info("🌐 PlaywrightCrawler proxy deshabilitado en ENVIRONMENT=dev")
-        return None
-    if not strategy_settings.get("use_proxy", True):
-        logger.info("🌐 PlaywrightCrawler proxy deshabilitado por configuracion")
-        return None
-    if not PLAYWRIGHT_CRAWLER_PROXY_URLS:
-        logger.info("🌐 PlaywrightCrawler sin lista de proxies configurada")
-        return None
-    logger.info(
-        "🌐 PlaywrightCrawler proxies configurados | count=%s",
-        len(PLAYWRIGHT_CRAWLER_PROXY_URLS),
-    )
-    return ProxyConfiguration(proxy_urls=PLAYWRIGHT_CRAWLER_PROXY_URLS)
-
-
-def has_meaningful_page_data(data: Dict[str, Any]) -> bool:
-    if not isinstance(data, dict):
-        return False
-    if data.get("title"):
-        return True
-    if data.get("h1s") or data.get("h2s") or data.get("h3s"):
-        return True
-    return False
-
-
-async def scrape_with_beautifulsoup(url: str) -> Dict[str, Any]:
-    started_at = time.perf_counter()
-    logger.info("🕷️ Estrategia BeautifulSoupCrawler | url=%s", url)
-    result: Dict[str, Any] = {
-        "url": url,
-        "title": None,
-        "h1s": [],
-        "h2s": [],
-        "h3s": [],
-        "_proxy_used": "none",
-        "_error": None,
-    }
-    crawler = BeautifulSoupCrawler(
-        max_request_retries=1,
-        request_handler_timeout=timedelta(seconds=30),
-        max_requests_per_crawl=1,
-        proxy_configuration=build_beautifulsoup_proxy_configuration(),
-        http_client=build_beautifulsoup_http_client(),
-    )
-    done = asyncio.get_running_loop().create_future()
-    attempt_counter = {"count": 0}
-
-    @crawler.router.default_handler
-    async def request_handler(context: BeautifulSoupCrawlingContext) -> None:
-        attempt_counter["count"] += 1
-        proxy_url = getattr(getattr(context, "proxy_info", None), "url", None)
-        logger.info(
-            "🕷️ BeautifulSoup procesando respuesta | url=%s attempt=%s proxy=%s",
-            context.request.url,
-            attempt_counter["count"],
-            proxy_url or "none",
-        )
-        html_preview = str(context.soup)[:500].replace("\n", " ").replace("\r", " ")
-        logger.info(
-            "🕷️ BeautifulSoup html preview | url=%s html_500=%s",
-            context.request.url,
-            html_preview,
-        )
-        parsed = {
-            "url": context.request.url,
-            "title": context.soup.title.string if context.soup.title else None,
-            "h1s": [h1.text for h1 in context.soup.find_all("h1")],
-            "h2s": [h2.text for h2 in context.soup.find_all("h2")],
-            "h3s": [h3.text for h3 in context.soup.find_all("h3")],
-            "_proxy_used": proxy_url or "none",
-            "_error": None,
-        }
-        if not done.done():
-            done.set_result(parsed)
-
-    @crawler.pre_navigation_hook
-    async def _hook(context: BasicCrawlingContext) -> None:
-        _ = context
-
-    try:
-        await crawler.run([url])
-        elapsed = time.perf_counter() - started_at
-        logger.info(
-            "🕷️ BeautifulSoupCrawler completado | url=%s attempts=%s elapsed=%.2fs",
-            url,
-            attempt_counter["count"],
-            elapsed,
-        )
-        if not done.done():
-            result["_error"] = "no_response_processed"
-            logger.warning(
-                "⚠️ BeautifulSoupCrawler termino sin procesar respuesta | url=%s attempts=%s elapsed=%.2fs",
-                url,
-                attempt_counter["count"],
-                elapsed,
+    for field, status in matches.items():
+        db_value = db_prices.get(field)
+        html_value = html_prices.get(field)
+        if status == "expirado":
+            expired_reasons.append(
+                f"{field}: DB={db_value} vs HTML={html_value}"
             )
-            done.set_result(result)
-    except asyncio.CancelledError:
-        elapsed = time.perf_counter() - started_at
-        result["_error"] = "cancelled"
-        logger.warning(
-            "⚠️ BeautifulSoupCrawler cancelado | url=%s attempts=%s elapsed=%.2fs",
-            url,
-            attempt_counter["count"],
-            elapsed,
-        )
-        if not done.done():
-            done.set_result(result)
-    except Exception as exc:
-        elapsed = time.perf_counter() - started_at
-        error_name = exc.__class__.__name__.lower()
-        result["_error"] = error_name or "beautifulsoup_error"
-        logger.warning("⚠️ BeautifulSoupCrawler fallo para %s: %s", url, exc)
-        logger.warning(
-            "⚠️ BeautifulSoupCrawler duracion con fallo | url=%s attempts=%s elapsed=%.2fs",
-            url,
-            attempt_counter["count"],
-            elapsed,
-        )
-        if not done.done():
-            done.set_result(result)
+        elif status == "vigente":
+            vigente_reasons.append(
+                f"{field}: DB={db_value} igual a HTML={html_value}"
+            )
+        else:
+            unchecked_reasons.append(
+                f"{field}: DB={db_value} / HTML={html_value}"
+            )
 
-    if done.done():
-        return done.result()
-    return result
-
-
-async def scrape_with_playwright(url: str) -> Dict[str, Any]:
-    started_at = time.perf_counter()
-    logger.info("🎭 Estrategia Playwright | url=%s", url)
-    proxy_settings = build_playwright_proxy_settings()
-    logger.info(
-        "🎭 Playwright usando proxy | url=%s proxy=%s",
-        url,
-        (proxy_settings or {}).get("server", "none"),
-    )
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ],
-            proxy=proxy_settings,
-        )
-        context = await browser.new_context(
-            locale="es-CL",
-            timezone_id="America/Santiago",
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1366, "height": 768},
-            extra_http_headers={"accept-language": "es-CL,es;q=0.9,en;q=0.8"},
-        )
-        page = await context.new_page()
-        await page.add_init_script(
-            """
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            Object.defineProperty(navigator, 'languages', { get: () => ['es-CL', 'es', 'en'] });
-            Object.defineProperty(navigator, 'platform', { get: () => 'MacIntel' });
-            """
-        )
-
-        try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_timeout(3500)
-            html = await page.content()
-            soup = BeautifulSoup(html, "html.parser")
-            html_preview = html[:500].replace("\n", " ").replace("\r", " ")
-            logger.info("🎭 Playwright html preview | url=%s html_500=%s", url, html_preview)
-            elapsed = time.perf_counter() - started_at
-            logger.info("🎭 Playwright cargo pagina | url=%s elapsed=%.2fs", url, elapsed)
-            return {
-                "url": url,
-                "title": await page.title(),
-                "h1s": [h1.text for h1 in soup.find_all("h1")],
-                "h2s": [h2.text for h2 in soup.find_all("h2")],
-                "h3s": [h3.text for h3 in soup.find_all("h3")],
-            }
-        except PlaywrightTimeoutError as exc:
-            elapsed = time.perf_counter() - started_at
-            logger.warning("⚠️ Playwright timeout para %s: %s", url, exc)
-            logger.warning("⚠️ Playwright duracion con timeout | url=%s elapsed=%.2fs", url, elapsed)
-            return {
-                "url": url,
-                "title": None,
-                "h1s": [],
-                "h2s": [],
-                "h3s": [],
-            }
-        finally:
-            await context.close()
-            await browser.close()
-
-
-async def scrape_with_playwright_crawler(url: str) -> Dict[str, Any]:
-    started_at = time.perf_counter()
-    logger.info("🎭 Estrategia PlaywrightCrawler | url=%s", url)
-    proxy_configuration = build_playwright_crawler_proxy_configuration()
-    result: Dict[str, Any] = {
-        "url": url,
-        "title": None,
-        "h1s": [],
-        "h2s": [],
-        "h3s": [],
+    return {
+        "expired_reasons": expired_reasons,
+        "vigente_reasons": vigente_reasons,
+        "unchecked_reasons": unchecked_reasons,
     }
-    crawler = PlaywrightCrawler(
-        max_request_retries=1,
-        request_handler_timeout=timedelta(seconds=60),
-        max_requests_per_crawl=1,
-        browser_type="chromium",
-        headless=True,
-        browser_launch_options={
-            "args": [
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ],
-        },
-        browser_new_context_options={
-            "locale": "es-CL",
-            "timezone_id": "America/Santiago",
-            "user_agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "viewport": {"width": 1366, "height": 768},
-            "extra_http_headers": {"accept-language": "es-CL,es;q=0.9,en;q=0.8"},
-        },
-        proxy_configuration=proxy_configuration,
-    )
-    done = asyncio.get_running_loop().create_future()
 
-    @crawler.router.default_handler
-    async def request_handler(context: PlaywrightCrawlingContext) -> None:
-        proxy_url = getattr(getattr(context, "proxy_info", None), "url", None)
+
+def get_best_price(prices: Dict[str, Any]) -> Optional[int]:
+    candidates = [
+        price_to_int(prices.get("cmr_price")),
+        price_to_int(prices.get("card_price")),
+        price_to_int(prices.get("cenco_card_price")),
+        price_to_int(prices.get("ripley_card_price")),
+        price_to_int(prices.get("current_price")),
+    ]
+    valid_candidates = [value for value in candidates if value is not None]
+    return min(valid_candidates) if valid_candidates else None
+
+
+def should_keep_product_published(
+    product_id: str,
+    db_prices: Dict[str, Any],
+    html_prices: Dict[str, Any],
+    enabled: bool,
+) -> bool:
+    if not enabled:
         logger.info(
-            "🎭 PlaywrightCrawler procesando respuesta | url=%s proxy=%s",
-            context.request.url,
-            proxy_url or "none",
+            "🧮 keep_published_on_better_price deshabilitado | product_id=%s",
+            product_id,
         )
-        await context.page.add_init_script(
-            """
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            Object.defineProperty(navigator, 'languages', { get: () => ['es-CL', 'es', 'en'] });
-            Object.defineProperty(navigator, 'platform', { get: () => 'MacIntel' });
-            """
-        )
-        html = await context.page.content()
-        soup = BeautifulSoup(html, "html.parser")
-        html_preview = html[:500].replace("\n", " ").replace("\r", " ")
+        return False
+
+    scraped_discount = price_to_int(html_prices.get("discount"))
+    if scraped_discount is None or scraped_discount < 50:
         logger.info(
-            "🎭 PlaywrightCrawler html preview | url=%s html_500=%s",
-            context.request.url,
-            html_preview,
+            "🧮 keep_published_on_better_price descartado por descuento | product_id=%s scraped_discount=%s",
+            product_id,
+            scraped_discount,
         )
-        parsed = {
-            "url": context.request.url,
-            "title": await context.page.title(),
-            "h1s": [h1.text for h1 in soup.find_all("h1")],
-            "h2s": [h2.text for h2 in soup.find_all("h2")],
-            "h3s": [h3.text for h3 in soup.find_all("h3")],
-        }
-        if not done.done():
-            done.set_result(parsed)
+        return False
+
+    db_best_price = get_best_price(db_prices)
+    html_best_price = get_best_price(html_prices)
+    if db_best_price is None or html_best_price is None:
+        logger.info(
+            "🧮 keep_published_on_better_price descartado por precios incompletos | product_id=%s db_best=%s html_best=%s",
+            product_id,
+            db_best_price,
+            html_best_price,
+        )
+        return False
+
+    is_better_price = html_best_price < db_best_price
+    logger.info(
+        "🧮 keep_published_on_better_price evaluado | product_id=%s scraped_discount=%s db_best=%s html_best=%s is_better_price=%s",
+        product_id,
+        scraped_discount,
+        db_best_price,
+        html_best_price,
+        is_better_price,
+    )
+    return is_better_price
+
+
+def create_price_expired_notification(
+    product: Dict[str, Any], result_item: Dict[str, Any], checked_at: datetime
+) -> None:
+    if mongo_db.notifications is None:
+        return
+
+    notification_doc = {
+        "type": "price_expired",
+        "title": "Producto archivado por precio expirado",
+        "message": (
+            f"El producto {product.get('product_id')} de "
+            f"{((product.get('store') or {}).get('store_id') or '').strip()} fue archivado "
+            "porque cambio su precio respecto a la base de datos."
+        ),
+        "product_id": str(product.get("product_id") or ""),
+        "product_hash_id": str(product.get("_id") or ""),
+        "product_name": str(product.get("product_name") or ""),
+        "store": ((product.get("store") or {}).get("store_id") or "").strip(),
+        "price_status": "expirado",
+        "metadata": {
+            "db_prices": result_item.get("db_prices") or {},
+            "html_prices": result_item.get("html_prices") or {},
+            "price_matches": result_item.get("price_matches") or {},
+        },
+        "read_by": [],
+        "created_at": checked_at,
+    }
+    mongo_db.notifications.insert_one(notification_doc)
+
+
+async def enqueue_price_check_job(payload: Dict[str, Any], run_url: str) -> Dict[str, Any]:
+    if not QSTASH_TOKEN:
+        return {"ok": False, "error": "QSTASH_TOKEN no configurado"}
+    if not is_valid_qstash_destination(run_url):
+        return {"ok": False, "error": f"URL destino invalida para QStash: {run_url}"}
+
+    publish_url = f"{QSTASH_URL}/v2/publish/{run_url}"
+    headers = {
+        "Authorization": f"Bearer {QSTASH_TOKEN}",
+        "Content-Type": "application/json",
+        "Upstash-Retries": str(QSTASH_RETRIES),
+    }
+    if PRICE_CHECKER_TOKEN:
+        headers["Upstash-Forward-X-Internal-Token"] = PRICE_CHECKER_TOKEN
 
     try:
-        await crawler.run([url])
-        elapsed = time.perf_counter() - started_at
-        logger.info(
-            "🎭 PlaywrightCrawler completado | url=%s elapsed=%.2fs",
-            url,
-            elapsed,
-        )
+        async with httpx.AsyncClient(timeout=QSTASH_TIMEOUT_SECONDS) as client:
+            response = await client.post(publish_url, headers=headers, json=payload)
+            if response.is_success:
+                return {
+                    "ok": True,
+                    "message_id": response.headers.get("Upstash-Message-Id"),
+                }
+            body_preview = (response.text or "")[:250]
+            return {
+                "ok": False,
+                "error": f"QStash status={response.status_code}: {body_preview}",
+            }
     except Exception as exc:
-        elapsed = time.perf_counter() - started_at
-        logger.warning("⚠️ PlaywrightCrawler fallo para %s: %s", url, exc)
-        logger.warning(
-            "⚠️ PlaywrightCrawler duracion con fallo | url=%s elapsed=%.2fs",
-            url,
-            elapsed,
-        )
-        if not done.done():
-            done.set_result(result)
+        return {"ok": False, "error": f"QStash error: {exc}"}
 
-    if done.done():
-        return done.result()
-    return result
+
+def is_valid_qstash_destination(target_url: str) -> bool:
+    parsed = urlparse(target_url)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    if host in {"localhost", "127.0.0.1", "0.0.0.0", "::1"}:
+        return False
+    return True
 
 
 async def scrape_current_page_data(store_id: str, product_url: str) -> Dict[str, Any]:
     normalized_store = normalize_store(store_id)
-    store_settings = get_store_scraping_settings(normalized_store)
-    primary_strategy = store_settings.get("primary_strategy", "beautifulsoup")
-    fallback_strategy = store_settings.get("fallback_strategy")
     logger.info(
-        "🔀 Estrategia seleccionada | store=%s normalized_store=%s primary=%s fallback=%s url=%s",
+        "🔀 Estrategia seleccionada | store=%s normalized_store=%s url=%s",
         store_id,
         normalized_store,
-        primary_strategy,
-        fallback_strategy or "none",
         product_url,
     )
-    if primary_strategy == "playwright":
-        data = await scrape_with_playwright(product_url)
-        data["_strategy"] = "playwright"
-        return data
-    if normalized_store == "ripley" and primary_strategy == "beautifulsoup":
-        soup_data = await scrape_with_beautifulsoup(product_url)
-        if has_meaningful_page_data(soup_data):
-            logger.info(
-                "🕷️ Ripley resuelto con BeautifulSoup | url=%s proxy=%s",
-                product_url,
-                soup_data.get("_proxy_used", "none"),
-            )
-            soup_data["_strategy"] = "beautifulsoup"
-            return soup_data
-        logger.warning(
-            "⚠️ Ripley sin data util con BeautifulSoup, usando fallback PlaywrightCrawler | url=%s reason=%s proxy=%s",
-            product_url,
-            soup_data.get("_error", "empty_response"),
-            soup_data.get("_proxy_used", "none"),
-        )
-        if fallback_strategy == "playwright_crawler":
-            data = await scrape_with_playwright_crawler(product_url)
-            data["_strategy"] = "beautifulsoup->playwright-crawler"
-            return data
-        soup_data["_strategy"] = "beautifulsoup"
-        return soup_data
-    if primary_strategy == "beautifulsoup":
-        data = await scrape_with_beautifulsoup(product_url)
-        data["_strategy"] = "beautifulsoup"
-        return data
-    if primary_strategy == "playwright_crawler":
-        data = await scrape_with_playwright_crawler(product_url)
-        data["_strategy"] = "playwright-crawler"
-        return data
+    if normalized_store == "falabella":
+        return await scrape_falabella(product_url)
+    if normalized_store == "paris":
+        return await scrape_paris(product_url)
+    if normalized_store == "meli":
+        return await scrape_meli(product_url)
+    if normalized_store == "ripley":
+        return await scrape_ripley(product_url)
     return {
         "url": product_url,
         "title": None,
@@ -654,12 +411,15 @@ async def run_price_checker_sync(request: ProductPriceCheckRequest) -> Dict[str,
         return {"summary": {"processed": 0, "vigente": 0, "expirado": 0, "no_checkeado": 0, "not_implemented": 0}, "results": []}
 
     results: List[Dict[str, Any]] = []
+    now = datetime.now(timezone.utc)
 
     for product in products:
         product_started_at = time.perf_counter()
+        mongo_id = product.get("_id")
         product_id = str(product.get("product_id") or "")
         store_id = normalize_store(((product.get("store") or {}).get("store_id") or "").strip())
         product_url = (product.get("link_market") or "").strip()
+        db_prices = product.get("prices") or {}
         logger.info(
             "🚀 Iniciando scraping | product_id=%s store=%s url=%s",
             product_id,
@@ -672,6 +432,24 @@ async def run_price_checker_sync(request: ProductPriceCheckRequest) -> Dict[str,
             "store": store_id,
             "product_url": product_url,
             "data": None,
+            "db_prices": {field: db_prices.get(field) for field in PRICE_FIELDS},
+            "html_prices": {field: None for field in PRICE_FIELDS},
+            "price_matches": {},
+            "price_status": "no-checkeado",
+            "archived": False,
+        }
+        update_doc: Dict[str, Any] = {
+            "price_status": "no-checkeado",
+            "price_checked_at": now,
+            "updated_at": now,
+            "price_check": {
+                "db_prices": {field: db_prices.get(field) for field in PRICE_FIELDS},
+                "html_prices": {field: None for field in PRICE_FIELDS},
+                "matches": {},
+                "status": "no-checkeado",
+                "checked_at": now,
+                "source": "descuentame-crawlee",
+            },
         }
 
         try:
@@ -679,6 +457,80 @@ async def run_price_checker_sync(request: ProductPriceCheckRequest) -> Dict[str,
                 raise ValueError("Producto sin URL o store_id")
 
             result_item["data"] = await scrape_current_page_data(store_id, product_url)
+            scraped_prices = (
+                (result_item["data"] or {}).get("prices")
+                if isinstance(result_item.get("data"), dict)
+                else None
+            ) or {}
+            result_item["html_prices"] = {
+                field: scraped_prices.get(field) for field in PRICE_FIELDS
+            }
+            update_doc["price_check"]["html_prices"] = result_item["html_prices"]
+
+            if any(result_item["html_prices"].values()):
+                price_status, matches = compare_prices(db_prices, result_item["html_prices"])
+                result_item["price_matches"] = matches
+                result_item["price_status"] = price_status
+                update_doc["price_check"]["matches"] = matches
+                update_doc["price_status"] = price_status
+                update_doc["price_check"]["status"] = price_status
+                decision_summary = summarize_price_decision(
+                    db_prices,
+                    result_item["html_prices"],
+                    matches,
+                )
+                result_item["decision_summary"] = decision_summary
+
+                if should_keep_product_published(
+                    product_id,
+                    db_prices,
+                    result_item["html_prices"],
+                    request.keep_published_on_better_price,
+                ):
+                    update_doc["prices"] = {
+                        **db_prices,
+                        **{
+                            field: value
+                            for field, value in result_item["html_prices"].items()
+                            if value is not None
+                        },
+                    }
+                    update_doc["status"] = "published"
+                    update_doc["price_status"] = "vigente"
+                    update_doc["price_check"]["status"] = "vigente"
+                    result_item["price_status"] = "vigente"
+                    result_item["archived"] = False
+                    result_item["action"] = "updated_and_published"
+                    logger.info(
+                        "📈 Se mantiene publicado porque el descuento es >= 50 y el mejor precio actual mejora al de la DB | product_id=%s db_best=%s html_best=%s",
+                        product_id,
+                        get_best_price(db_prices),
+                        get_best_price(result_item["html_prices"]),
+                    )
+
+                elif price_status == "expirado":
+                    update_doc["status"] = "archived"
+                    result_item["archived"] = True
+                    logger.info(
+                        "📦 Producto marcado como expirado porque hay diferencias relevantes en precios | product_id=%s motivos_expirado=%s motivos_vigente=%s",
+                        product_id,
+                        decision_summary["expired_reasons"],
+                        decision_summary["vigente_reasons"],
+                    )
+                    create_price_expired_notification(product, result_item, now)
+                elif price_status == "vigente":
+                    logger.info(
+                        "✅ Producto vigente, los precios comparables coinciden | product_id=%s motivos_vigente=%s",
+                        product_id,
+                        decision_summary["vigente_reasons"],
+                    )
+                else:
+                    logger.info(
+                        "ℹ️ Producto no-checkeado, faltan precios comparables | product_id=%s motivos=%s",
+                        product_id,
+                        decision_summary["unchecked_reasons"],
+                    )
+
             elapsed = time.perf_counter() - product_started_at
             logger.info(
                 "✅ Scraping completado | product_id=%s store=%s strategy=%s elapsed=%.2fs",
@@ -697,6 +549,8 @@ async def run_price_checker_sync(request: ProductPriceCheckRequest) -> Dict[str,
                 exc,
                 elapsed,
             )
+        if mongo_id is not None:
+            mongo_db.products.update_one({"_id": mongo_id}, {"$set": update_doc})
 
         results.append(result_item)
 
@@ -704,6 +558,9 @@ async def run_price_checker_sync(request: ProductPriceCheckRequest) -> Dict[str,
         "processed": len(results),
         "success": sum(1 for item in results if item.get("data")),
         "errors": sum(1 for item in results if item.get("error")),
+        "vigente": sum(1 for item in results if item["price_status"] == "vigente"),
+        "expirado": sum(1 for item in results if item["price_status"] == "expirado"),
+        "no_checkeado": sum(1 for item in results if item["price_status"] == "no-checkeado"),
         "not_implemented": 0,
     }
     total_elapsed = time.perf_counter() - request_started_at
@@ -736,13 +593,64 @@ async def health_check() -> Dict[str, Any]:
 @app.post("/api/v1/products/price-check/run")
 async def run_price_checker(
     request: ProductPriceCheckRequest,
+    http_request: Request,
+    x_internal_token: Optional[str] = Header(default=None),
+) -> Dict[str, Any]:
+    require_internal_token(x_internal_token)
+
+    if request.async_mode and ENVIRONMENT == "prod":
+        run_url = PRICE_CHECK_RUN_URL or str(http_request.url_for("run_price_checker_worker"))
+        enqueue_payload = {
+            "batch_size": request.batch_size,
+            "store": request.store,
+            "product_id": request.product_id,
+            "keep_published_on_better_price": request.keep_published_on_better_price,
+            "async_mode": False,
+            "allow_sync_fallback": False,
+        }
+        queue_result = await enqueue_price_check_job(enqueue_payload, run_url)
+        if queue_result.get("ok"):
+            logger.info(
+                "📬 Price-check encolado | run_url=%s message_id=%s",
+                run_url,
+                queue_result.get("message_id"),
+            )
+            return {
+                "success": True,
+                "message": "Price-check encolado",
+                "data": {
+                    "queued": True,
+                    "queue": "qstash",
+                    "message_id": queue_result.get("message_id"),
+                    "run_url": run_url,
+                },
+            }
+
+        logger.warning("⚠️ No se pudo encolar price-check: %s", queue_result.get("error"))
+        if not request.allow_sync_fallback:
+            raise HTTPException(
+                status_code=503,
+                detail=f"No se pudo encolar en QStash: {queue_result.get('error')}",
+            )
+
+    data = await run_price_checker_sync(request)
+    return {
+        "success": True,
+        "message": "Price-check ejecutado",
+        "data": data,
+    }
+
+
+@app.post("/api/v1/products/price-check/worker", name="run_price_checker_worker")
+async def run_price_checker_worker(
+    request: ProductPriceCheckRequest,
     x_internal_token: Optional[str] = Header(default=None),
 ) -> Dict[str, Any]:
     require_internal_token(x_internal_token)
     data = await run_price_checker_sync(request)
     return {
         "success": True,
-        "message": "Price-check ejecutado",
+        "message": "Price-check worker ejecutado",
         "data": data,
     }
 
