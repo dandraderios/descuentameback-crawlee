@@ -78,8 +78,18 @@ def get_strategy_settings(strategy: str) -> Dict[str, Any]:
     return dict(defaults.get(strategy) or {})
 
 
-def build_beautifulsoup_proxy_configuration() -> Optional[ProxyConfiguration]:
-    strategy_settings = get_strategy_settings("beautifulsoup")
+def get_store_strategy_settings(store: Optional[str], strategy: str) -> Dict[str, Any]:
+    settings = get_strategy_settings(strategy)
+    if not store:
+        return settings
+    store_config = ((SCRAPING_CONFIG.get("stores") or {}).get(store) or {})
+    strategy_overrides = (store_config.get(strategy) or {})
+    settings.update(strategy_overrides)
+    return settings
+
+
+def build_beautifulsoup_proxy_configuration(store: Optional[str] = None) -> Optional[ProxyConfiguration]:
+    strategy_settings = get_store_strategy_settings(store, "beautifulsoup")
     if ENVIRONMENT == "dev":
         logger.info("🌐 BeautifulSoup proxy deshabilitado en ENVIRONMENT=dev")
         return None
@@ -96,8 +106,8 @@ def build_beautifulsoup_proxy_configuration() -> Optional[ProxyConfiguration]:
     return ProxyConfiguration(proxy_urls=BEAUTIFULSOUP_PROXY_URLS)
 
 
-def build_beautifulsoup_http_client() -> Optional[ImpitHttpClient]:
-    strategy_settings = get_strategy_settings("beautifulsoup")
+def build_beautifulsoup_http_client(store: Optional[str] = None) -> Optional[ImpitHttpClient]:
+    strategy_settings = get_store_strategy_settings(store, "beautifulsoup")
     if ENVIRONMENT == "dev":
         logger.info("🕷️ BeautifulSoup usando http client por defecto en ENVIRONMENT=dev")
         return None
@@ -108,8 +118,8 @@ def build_beautifulsoup_http_client() -> Optional[ImpitHttpClient]:
     return ImpitHttpClient(timeout=10)
 
 
-def build_playwright_proxy_settings() -> Optional[Dict[str, str]]:
-    strategy_settings = get_strategy_settings("playwright")
+def build_playwright_proxy_settings(store: Optional[str] = None) -> Optional[Dict[str, str]]:
+    strategy_settings = get_store_strategy_settings(store, "playwright")
     if ENVIRONMENT == "dev":
         logger.info("🌐 Playwright proxy deshabilitado en ENVIRONMENT=dev")
         return None
@@ -140,8 +150,8 @@ def build_playwright_proxy_settings() -> Optional[Dict[str, str]]:
     return proxy_settings
 
 
-def build_playwright_crawler_proxy_configuration() -> Optional[ProxyConfiguration]:
-    strategy_settings = get_strategy_settings("playwright_crawler")
+def build_playwright_crawler_proxy_configuration(store: Optional[str] = None) -> Optional[ProxyConfiguration]:
+    strategy_settings = get_store_strategy_settings(store, "playwright_crawler")
     if ENVIRONMENT == "dev":
         logger.info("🌐 PlaywrightCrawler proxy deshabilitado en ENVIRONMENT=dev")
         return None
@@ -182,7 +192,7 @@ def default_soup_extractor(
 
 
 async def scrape_with_beautifulsoup(
-    url: str, extractor: Optional[SoupExtractor] = None
+    url: str, extractor: Optional[SoupExtractor] = None, store: Optional[str] = None
 ) -> Dict[str, Any]:
     started_at = time.perf_counter()
     logger.info("🕷️ Estrategia BeautifulSoupCrawler | url=%s", url)
@@ -199,8 +209,8 @@ async def scrape_with_beautifulsoup(
         max_request_retries=1,
         request_handler_timeout=timedelta(seconds=30),
         max_requests_per_crawl=1,
-        proxy_configuration=build_beautifulsoup_proxy_configuration(),
-        http_client=build_beautifulsoup_http_client(),
+        proxy_configuration=build_beautifulsoup_proxy_configuration(store),
+        http_client=build_beautifulsoup_http_client(store),
     )
     done = asyncio.get_running_loop().create_future()
     attempt_counter = {"count": 0}
@@ -282,11 +292,11 @@ async def scrape_with_beautifulsoup(
 
 
 async def scrape_with_playwright(
-    url: str, extractor: Optional[SoupExtractor] = None
+    url: str, extractor: Optional[SoupExtractor] = None, store: Optional[str] = None
 ) -> Dict[str, Any]:
     started_at = time.perf_counter()
     logger.info("🎭 Estrategia Playwright | url=%s", url)
-    proxy_settings = build_playwright_proxy_settings()
+    proxy_settings = build_playwright_proxy_settings(store)
     logger.info(
         "🎭 Playwright usando proxy | url=%s proxy=%s",
         url,
@@ -353,11 +363,11 @@ async def scrape_with_playwright(
 
 
 async def scrape_with_playwright_crawler(
-    url: str, extractor: Optional[SoupExtractor] = None
+    url: str, extractor: Optional[SoupExtractor] = None, store: Optional[str] = None
 ) -> Dict[str, Any]:
     started_at = time.perf_counter()
     logger.info("🎭 Estrategia PlaywrightCrawler | url=%s", url)
-    proxy_configuration = build_playwright_crawler_proxy_configuration()
+    proxy_configuration = build_playwright_crawler_proxy_configuration(store)
     result: Dict[str, Any] = {
         "url": url,
         "title": None,

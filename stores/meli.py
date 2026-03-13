@@ -20,6 +20,6 @@ def extract_meli_data(
 
 
 async def scrape(url: str) -> Dict[str, Any]:
-    data = await scrape_with_playwright(url, extractor=extract_meli_data)
+    data = await scrape_with_playwright(url, extractor=extract_meli_data, store="meli")
     data["_strategy"] = "playwright"
     return data

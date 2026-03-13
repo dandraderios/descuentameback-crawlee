@@ -19,10 +19,16 @@
       "primary_strategy": "beautifulsoup"
     },
     "meli": {
-      "primary_strategy": "playwright"
+      "primary_strategy": "playwright",
+      "playwright": {
+        "use_proxy": false
+      }
     },
     "mercadolibre": {
-      "primary_strategy": "playwright"
+      "primary_strategy": "playwright",
+      "playwright": {
+        "use_proxy": false
+      }
     },
     "ripley": {
       "primary_strategy": "beautifulsoup",
